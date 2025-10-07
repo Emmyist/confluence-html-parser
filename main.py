@@ -1,69 +1,62 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from bs4 import BeautifulSoup
+import re
 import json
 
 app = FastAPI()
 
 @app.post("/")
-async def parse_confluence_table(request: Request):
+async def parse_confluence_data(request: Request):
     try:
-        body = await request.json()
-        data = body.get("data")
-        fmt = body.get("format", "html")
+        raw_body = await request.body()
+        text = raw_body.decode("utf-8", errors="ignore").strip()
+
+        print("🔹 Raw body received:")
+        print(text[:400] + "..." if len(text) > 400 else text)
+
+        # If Jira sends JSON, try to parse it
+        data = None
+        format = "html"
+        try:
+            body = json.loads(text)
+            data = body.get("data")
+            format = body.get("format", "html")
+        except json.JSONDecodeError:
+            # Not JSON → assume it’s raw HTML directly
+            data = text
 
         if not data:
-            return JSONResponse({"error": "No data received"}, status_code=400)
+            return JSONResponse({"error": "No data found"}, status_code=400)
 
+        # --- 🧩 Clean HTML and extract table ---
         rows = []
+        table_match = re.search(r"<table[\s\S]*?</table>", data)
+        if not table_match:
+            return JSONResponse({"error": "No <table> found in data"}, status_code=400)
 
-        # ✅ HTML parsing
-        if fmt == "html":
-            soup = BeautifulSoup(data, "html.parser")
-            table = soup.find("table")
-            if not table:
-                return JSONResponse({"error": "No <table> found in HTML"}, status_code=400)
+        table_html = table_match.group(0)
 
-            for tr in table.find_all("tr"):
-                cells = []
-                for cell in tr.find_all(["td", "th"]):
-                    # Clean text or <time> tag
-                    time_tag = cell.find("time")
-                    if time_tag and time_tag.get("datetime"):
-                        cells.append(time_tag["datetime"])
-                    else:
-                        text = cell.get_text(strip=True)
-                        cells.append(text)
-                if cells:
-                    rows.append(cells)
+        # Find rows
+        row_matches = re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", table_html)
+        for row in row_matches:
+            # Find cells in each row
+            cell_matches = re.findall(r"<t[dh][^>]*>([\s\S]*?)</t[dh]>", row)
+            cleaned_cells = []
+            for c in cell_matches:
+                # remove inner tags like <p>, <time>, etc.
+                text_value = re.sub(r"<[^>]+>", "", c)
+                text_value = re.sub(r"&nbsp;", " ", text_value)
+                cleaned_cells.append(text_value.strip())
+            if cleaned_cells:
+                rows.append(cleaned_cells)
 
-        # ✅ ADF parsing
-        elif fmt == "adf":
-            adf = json.loads(data) if isinstance(data, str) else data
-            table_block = next((c for c in adf.get("content", []) if c.get("type") == "table"), None)
-            if not table_block:
-                return JSONResponse({"error": "No table found in ADF"}, status_code=400)
+        print("✅ Parsed rows:", rows)
 
-            for row in table_block.get("content", []):
-                row_data = []
-                for cell in row.get("content", []):
-                    try:
-                        paragraph = cell["content"][0]["content"]
-                        text_parts = []
-                        for p in paragraph:
-                            if p["type"] == "date":
-                                text_parts.append(p["attrs"]["timestamp"])
-                            elif "text" in p:
-                                text_parts.append(p["text"])
-                        row_data.append(" ".join(text_parts).strip())
-                    except Exception:
-                        row_data.append("")
-                rows.append(row_data)
-
-        else:
-            return JSONResponse({"error": f"Unknown format '{fmt}'"}, status_code=400)
-
-        return JSONResponse({"rows": rows})
+        return JSONResponse({
+            "row_count": len(rows),
+            "rows": rows
+        })
 
     except Exception as e:
+        print("❌ ERROR:", str(e))
         return JSONResponse({"error": str(e)}, status_code=500)
