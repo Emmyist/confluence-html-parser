@@ -1,62 +1,44 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import re
 import json
+from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-@app.post("/")
-async def parse_confluence_data(request: Request):
+@app.post("/parse-table")
+async def parse_table(request: Request):
     try:
+        # Step 1: Read the raw text body
         raw_body = await request.body()
-        text = raw_body.decode("utf-8", errors="ignore").strip()
+        raw_text = raw_body.decode("utf-8")
 
-        print("🔹 Raw body received:")
-        print(text[:400] + "..." if len(text) > 400 else text)
+        print("=== RAW BODY RECEIVED ===")
+        print(raw_text[:1000])  # Print first 1000 chars for inspection
 
-        # If Jira sends JSON, try to parse it
-        data = None
-        format = "html"
+        # Step 2: Try parsing JSON safely
         try:
-            body = json.loads(text)
-            data = body.get("data")
-            format = body.get("format", "html")
-        except json.JSONDecodeError:
-            # Not JSON → assume it’s raw HTML directly
-            data = text
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as e:
+            return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {str(e)}"})
 
-        if not data:
-            return JSONResponse({"error": "No data found"}, status_code=400)
+        # Step 3: Extract the HTML from known keys
+        html_content = (
+            data.get("body", {}).get("body", {}).get("storage", {}).get("value") or
+            data.get("body", {}).get("storage", {}).get("value")
+        )
 
-        # --- 🧩 Clean HTML and extract table ---
+        if not html_content:
+            return JSONResponse(status_code=400, content={"error": "No HTML found in body"})
+
+        # Step 4: Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
         rows = []
-        table_match = re.search(r"<table[\s\S]*?</table>", data)
-        if not table_match:
-            return JSONResponse({"error": "No <table> found in data"}, status_code=400)
+        for row in soup.select("table tr"):
+            cols = [col.get_text(strip=True) for col in row.find_all(["th", "td"])]
+            if cols:
+                rows.append(cols)
 
-        table_html = table_match.group(0)
-
-        # Find rows
-        row_matches = re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", table_html)
-        for row in row_matches:
-            # Find cells in each row
-            cell_matches = re.findall(r"<t[dh][^>]*>([\s\S]*?)</t[dh]>", row)
-            cleaned_cells = []
-            for c in cell_matches:
-                # remove inner tags like <p>, <time>, etc.
-                text_value = re.sub(r"<[^>]+>", "", c)
-                text_value = re.sub(r"&nbsp;", " ", text_value)
-                cleaned_cells.append(text_value.strip())
-            if cleaned_cells:
-                rows.append(cleaned_cells)
-
-        print("✅ Parsed rows:", rows)
-
-        return JSONResponse({
-            "row_count": len(rows),
-            "rows": rows
-        })
+        return {"success": True, "rows": rows}
 
     except Exception as e:
-        print("❌ ERROR:", str(e))
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": str(e)})
